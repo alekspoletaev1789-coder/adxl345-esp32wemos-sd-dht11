@@ -1,0 +1,576 @@
+# vibration_monitor_pro.py
+import os
+import struct
+import time
+from datetime import datetime
+import numpy as np
+import serial
+import pyqtgraph as pg
+from pyqtgraph.Qt import QtCore, QtWidgets, QtGui
+import csv
+
+# ===================== НАСТРОЙКИ =====================
+PORT = "COM3"
+BAUD = 921600
+SER_TIMEOUT = 0.10
+
+# Параметры отображения
+WINDOW_SEC = 2.0          # Длительность окна в секундах
+NFFT_MAX = 4096           # Максимальный размер FFT
+
+# Частотные диапазоны
+VEL_F_MAX = 1000.0        # Макс частота для спектра виброскорости
+ACC_F_MAX = 1600.0        # Макс частота для спектра ускорения
+
+# Параметры ADXL345
+MG_PER_LSB = 3.9          # 3.9 мг/LSB для ±16g
+G = 9.80665               # Ускорение свободного падения
+ACC_SCALE = (MG_PER_LSB / 1000.0) * G  # м/с² на LSB
+
+# Протокол
+MAGIC = 0xA55A5AA5
+HDR_FMT = "<IIHHhh"       # magic(4), timestamp(4), fs(2), n(2), temp(2), hum(2)
+HDR_SIZE = struct.calcsize(HDR_FMT)
+
+# Папки для сохранения
+SAVE_DIR = os.path.join(os.path.expanduser("~"), "Documents", "VibrationData")
+RECORD_DURATIONS = [10, 30, 60, 300]  # 10с, 30с, 1м, 5м
+
+class FrameReader:
+    """Чтение и парсинг кадров данных"""
+    def __init__(self, ser):
+        self.ser = ser
+        self.buffer = bytearray()
+    
+    def read_frame(self):
+        """Чтение одного кадра данных"""
+        # Дополнение буфера
+        chunk = self.ser.read(4096)
+        if chunk:
+            self.buffer.extend(chunk)
+        
+        # Поиск магического числа
+        magic_bytes = struct.pack("<I", MAGIC)
+        pos = self.buffer.find(magic_bytes)
+        
+        if pos < 0:
+            # Магическое число не найдено, очистить буфер
+            if len(self.buffer) > 10000:
+                self.buffer = bytearray()
+            return None
+        
+        # Удалить мусор до магического числа
+        if pos > 0:
+            del self.buffer[:pos]
+        
+        # Проверка наличия полного заголовка
+        if len(self.buffer) < HDR_SIZE:
+            return None
+        
+        # Парсинг заголовка
+        hdr = struct.unpack(HDR_FMT, self.buffer[:HDR_SIZE])
+        magic, timestamp, fs, n_samples, temp10, hum10 = hdr
+        
+        if magic != MAGIC:
+            del self.buffer[:4]
+            return None
+        
+        # Проверка наличия полных данных
+        data_size = n_samples * 3 * 2  # 3 оси × 2 байта на отсчет
+        total_size = HDR_SIZE + data_size
+        
+        if len(self.buffer) < total_size:
+            return None
+        
+        # Извлечение данных
+        data = self.buffer[HDR_SIZE:total_size]
+        del self.buffer[:total_size]
+        
+        # Преобразование в массив numpy
+        samples = np.frombuffer(data, dtype=np.int16).reshape(n_samples, 3)
+        samples = samples.astype(np.float32) * ACC_SCALE / 256.0
+        
+        return {
+            'timestamp': timestamp,
+            'fs': fs,
+            'n': n_samples,
+            'temp': temp10 / 10.0 if temp10 != -999 else np.nan,
+            'hum': hum10 / 10.0 if hum10 != -999 else np.nan,
+            'x': samples[:, 0],
+            'y': samples[:, 1],
+            'z': samples[:, 2],
+            'raw': self.buffer[:total_size]
+        }
+
+def calculate_spectra(signal, fs, remove_dc=True, apply_hanning=True):
+    """Расчет спектров ускорения и виброскорости"""
+    n = len(signal)
+    if n < 256:
+        return None, None, None
+    
+    # Копирование и предобработка
+    s = signal.copy().astype(np.float32)
+    
+    if remove_dc:
+        s = s - np.mean(s)
+    
+    if apply_hanning:
+        window = np.hanning(n)
+        s = s * window
+        window_sum = np.sum(window)
+    else:
+        window_sum = float(n)
+    
+    # БПФ ускорения
+    acc_fft = np.fft.rfft(s)
+    freqs = np.fft.rfftfreq(n, d=1.0/fs)
+    
+    # Амплитудный спектр ускорения
+    acc_spectrum = (2.0 / window_sum) * np.abs(acc_fft)
+    
+    # Спектр виброскорости (интегрирование в частотной области)
+    omega = 2.0 * np.pi * freqs
+    vel_fft = np.zeros_like(acc_fft, dtype=np.complex64)
+    vel_fft[1:] = acc_fft[1:] / (1j * omega[1:])
+    vel_spectrum = (2.0 / window_sum) * np.abs(vel_fft) * 1000.0  # в мм/с
+    
+    return freqs, acc_spectrum, vel_spectrum
+
+def calculate_displacement_spectrum(acc_spectrum, freqs):
+    """Расчет спектра виброперемещения"""
+    omega = 2.0 * np.pi * freqs
+    disp_spectrum = acc_spectrum.copy()
+    disp_spectrum[1:] = acc_spectrum[1:] / (omega[1:]**2) * 1e6  # в микрометрах
+    disp_spectrum[0] = 0  # DC компонента
+    return disp_spectrum
+
+class AxisTab(QtWidgets.QWidget):
+    """Вкладка для отображения данных по одной оси"""
+    def __init__(self, axis_name):
+        super().__init__()
+        
+        self.axis_name = axis_name
+        self.setup_ui()
+    
+    def setup_ui(self):
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(4)
+        
+        # 1. Окно осциллограммы
+        self.osc_plot = pg.PlotWidget(title=f"{self.axis_name}: Осциллограмма")
+        self.osc_plot.showGrid(x=True, y=True, alpha=0.3)
+        self.osc_plot.setLabel('bottom', 'Время, с')
+        self.osc_plot.setLabel('left', 'Ускорение, м/с²')
+        self.osc_curve = self.osc_plot.plot(pen=pg.mkPen('y', width=1))
+        layout.addWidget(self.osc_plot, stretch=1)
+        
+        # 2. Спектр виброскорости (до 1000 Гц)
+        self.vel_plot = pg.PlotWidget(title=f"{self.axis_name}: Спектр виброскорости (0-1000 Гц)")
+        self.vel_plot.showGrid(x=True, y=True, alpha=0.3)
+        self.vel_plot.setLabel('bottom', 'Частота, Гц')
+        self.vel_plot.setLabel('left', 'Скорость, мм/с')
+        self.vel_plot.setXRange(0, 1000)
+        self.vel_curve = self.vel_plot.plot(pen=pg.mkPen('g', width=1))
+        layout.addWidget(self.vel_plot, stretch=1)
+        
+        # 3. Спектр виброперемещения
+        self.disp_plot = pg.PlotWidget(title=f"{self.axis_name}: Спектр виброперемещения")
+        self.disp_plot.showGrid(x=True, y=True, alpha=0.3)
+        self.disp_plot.setLabel('bottom', 'Частота, Гц')
+        self.disp_plot.setLabel('left', 'Перемещение, мкм')
+        self.disp_plot.setXRange(0, 1000)
+        self.disp_curve = self.disp_plot.plot(pen=pg.mkPen('b', width=1))
+        layout.addWidget(self.disp_plot, stretch=1)
+        
+        # 4. Спектр ускорения (до 1600 Гц)
+        self.acc_plot = pg.PlotWidget(title=f"{self.axis_name}: Спектр ускорения (0-1600 Гц)")
+        self.acc_plot.showGrid(x=True, y=True, alpha=0.3)
+        self.acc_plot.setLabel('bottom', 'Частота, Гц')
+        self.acc_plot.setLabel('left', 'Ускорение, м/с²')
+        self.acc_plot.setXRange(0, 1600)
+        self.acc_curve = self.acc_plot.plot(pen=pg.mkPen('r', width=1))
+        layout.addWidget(self.acc_plot, stretch=1)
+    
+    def update_plots(self, time_data, acc_data, fs):
+        """Обновление всех графиков"""
+        # Осциллограмма
+        self.osc_curve.setData(time_data, acc_data)
+        
+        # Расчет спектров
+        if len(acc_data) >= 256:
+            freqs, acc_spec, vel_spec = calculate_spectra(acc_data, fs)
+            
+            if freqs is not None:
+                # Спектр виброскорости (до 1000 Гц)
+                mask = freqs <= 1000
+                self.vel_curve.setData(freqs[mask], vel_spec[mask])
+                
+                # Спектр ускорения (до 1600 Гц)
+                mask_acc = freqs <= 1600
+                self.acc_curve.setData(freqs[mask_acc], acc_spec[mask_acc])
+                
+                # Спектр виброперемещения
+                disp_spec = calculate_displacement_spectrum(acc_spec, freqs)
+                self.disp_curve.setData(freqs[mask], disp_spec[mask])
+
+class MainWindow(QtWidgets.QMainWindow):
+    def __init__(self):
+        super().__init__()
+        
+        # Инициализация переменных
+        self.serial_port = None
+        self.reader = None
+        self.is_streaming = False
+        self.is_recording = False
+        self.record_file = None
+        self.record_duration = 30  # секунд
+        self.record_start_time = 0
+        
+        # Буферы данных
+        self.fs = None
+        self.max_samples = 1
+        self.data_buffers = {'x': np.array([]), 'y': np.array([]), 'z': np.array([])}
+        self.time_buffer = np.array([])
+        self.temperatures = []
+        self.humidities = []
+        
+        # Статистика
+        self.frame_count = 0
+        self.last_update = time.time()
+        
+        # Настройка UI
+        self.setup_ui()
+        
+        # Попытка подключения
+        self.connect_serial()
+        
+        # Таймер обновления
+        self.timer = QtCore.QTimer()
+        self.timer.timeout.connect(self.update_data)
+        self.timer.start(50)  # 20 Гц
+        
+        # Таймер автосохранения
+        self.save_timer = QtCore.QTimer()
+        self.save_timer.timeout.connect(self.check_recording)
+        self.save_timer.start(1000)
+    
+    def setup_ui(self):
+        self.setWindowTitle("Система мониторинга вибрации - ESP32 + ADXL345 + DHT11")
+        self.setGeometry(100, 100, 1600, 1000)
+        
+        central_widget = QtWidgets.QWidget()
+        self.setCentralWidget(central_widget)
+        
+        main_layout = QtWidgets.QVBoxLayout(central_widget)
+        main_layout.setContentsMargins(8, 8, 8, 8)
+        main_layout.setSpacing(8)
+        
+        # Панель управления
+        control_panel = self.create_control_panel()
+        main_layout.addWidget(control_panel)
+        
+        # Вкладки с графиками
+        self.tab_widget = QtWidgets.QTabWidget()
+        self.x_tab = AxisTab("Ось X")
+        self.y_tab = AxisTab("Ось Y")
+        self.z_tab = AxisTab("Ось Z")
+        
+        self.tab_widget.addTab(self.x_tab, "Ось X")
+        self.tab_widget.addTab(self.y_tab, "Ось Y")
+        self.tab_widget.addTab(self.z_tab, "Ось Z")
+        
+        main_layout.addWidget(self.tab_widget, stretch=1)
+        
+        # Статусная строка
+        self.status_label = QtWidgets.QLabel("Статус: Ожидание подключения...")
+        main_layout.addWidget(self.status_label)
+    
+    def create_control_panel(self):
+        panel = QtWidgets.QWidget()
+        layout = QtWidgets.QHBoxLayout(panel)
+        layout.setContentsMargins(0, 0, 0, 0)
+        
+        # Кнопки управления
+        self.btn_connect = QtWidgets.QPushButton("Подключиться")
+        self.btn_connect.clicked.connect(self.connect_serial)
+        layout.addWidget(self.btn_connect)
+        
+        self.btn_start = QtWidgets.QPushButton("Старт (S)")
+        self.btn_start.clicked.connect(self.start_streaming)
+        self.btn_start.setEnabled(False)
+        layout.addWidget(self.btn_start)
+        
+        self.btn_stop = QtWidgets.QPushButton("Стоп (X)")
+        self.btn_stop.clicked.connect(self.stop_streaming)
+        self.btn_stop.setEnabled(False)
+        layout.addWidget(self.btn_stop)
+        
+        self.btn_one_frame = QtWidgets.QPushButton("Один кадр (1)")
+        self.btn_one_frame.clicked.connect(self.one_frame)
+        self.btn_one_frame.setEnabled(False)
+        layout.addWidget(self.btn_one_frame)
+        
+        layout.addSpacing(20)
+        
+        # Запись данных
+        layout.addWidget(QtWidgets.QLabel("Запись:"))
+        
+        self.record_combo = QtWidgets.QComboBox()
+        self.record_combo.addItems(["10 сек", "30 сек", "1 мин", "5 мин"])
+        self.record_combo.setCurrentIndex(1)
+        self.record_combo.currentIndexChanged.connect(self.record_duration_changed)
+        layout.addWidget(self.record_combo)
+        
+        self.btn_record = QtWidgets.QPushButton("Запись (R)")
+        self.btn_record.clicked.connect(self.toggle_recording)
+        self.btn_record.setEnabled(False)
+        layout.addWidget(self.btn_record)
+        
+        layout.addSpacing(20)
+        
+        # Температура и влажность
+        self.temp_label = QtWidgets.QLabel("Температура: --°C")
+        layout.addWidget(self.temp_label)
+        
+        self.hum_label = QtWidgets.QLabel("Влажность: --%")
+        layout.addWidget(self.hum_label)
+        
+        layout.addStretch()
+        
+        return panel
+    
+    def record_duration_changed(self, index):
+        durations = [10, 30, 60, 300]
+        self.record_duration = durations[index]
+    
+    def connect_serial(self):
+        try:
+            if self.serial_port and self.serial_port.is_open:
+                self.serial_port.close()
+            
+            self.serial_port = serial.Serial(PORT, BAUD, timeout=SER_TIMEOUT)
+            time.sleep(2)  # Ожидание инициализации
+            
+            self.reader = FrameReader(self.serial_port)
+            
+            self.btn_start.setEnabled(True)
+            self.btn_stop.setEnabled(True)
+            self.btn_one_frame.setEnabled(True)
+            self.btn_record.setEnabled(True)
+            self.btn_connect.setEnabled(False)
+            
+            self.status_label.setText(f"Подключено к {PORT}, {BAUD} бод")
+            
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Ошибка подключения", 
+                                          f"Не удалось подключиться к {PORT}\nОшибка: {str(e)}")
+    
+    def start_streaming(self):
+        if self.serial_port:
+            self.serial_port.write(b"S\n")
+            self.is_streaming = True
+            self.status_label.setText("Потоковое вещание запущено")
+    
+    def stop_streaming(self):
+        if self.serial_port:
+            self.serial_port.write(b"X\n")
+            self.is_streaming = False
+            self.status_label.setText("Потоковое вещание остановлено")
+    
+    def one_frame(self):
+        if self.serial_port:
+            self.serial_port.write(b"1\n")
+            self.status_label.setText("Запрос одного кадра")
+    
+    def toggle_recording(self):
+        if not self.is_recording:
+            self.start_recording()
+        else:
+            self.stop_recording()
+    
+    def start_recording(self):
+        if not self.serial_port:
+            return
+        
+        # Создание папки для данных
+        os.makedirs(SAVE_DIR, exist_ok=True)
+        
+        # Генерация имени файла
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.record_file = os.path.join(SAVE_DIR, f"vibration_{timestamp}.bin")
+        
+        # Отправка команды записи на ESP32
+        self.serial_port.write(f"R{self.record_duration}\n".encode())
+        
+        self.is_recording = True
+        self.record_start_time = time.time()
+        self.btn_record.setText("Стоп запись")
+        self.btn_record.setStyleSheet("background-color: red; color: white;")
+        
+        self.status_label.setText(f"Запись начата: {self.record_file}")
+    
+    def stop_recording(self):
+        if self.serial_port and self.is_recording:
+            self.serial_port.write(b"X\n")
+            self.is_recording = False
+            self.btn_record.setText("Запись (R)")
+            self.btn_record.setStyleSheet("")
+            
+            # Экспорт в CSV
+            if self.record_file and os.path.exists(self.record_file):
+                self.export_to_csv(self.record_file)
+            
+            self.status_label.setText(f"Запись завершена: {self.record_file}")
+    
+    def check_recording(self):
+        if self.is_recording and (time.time() - self.record_start_time >= self.record_duration):
+            self.stop_recording()
+    
+    def export_to_csv(self, bin_file):
+        """Экспорт бинарного файла в CSV для MATLAB"""
+        csv_file = bin_file.replace('.bin', '.csv')
+        
+        try:
+            with open(bin_file, 'rb') as f_bin, open(csv_file, 'w', newline='') as f_csv:
+                writer = csv.writer(f_csv)
+                # Заголовок
+                writer.writerow(['timestamp_us', 'fs', 'n_samples', 'temp_C', 'hum_pct', 
+                               'acc_x', 'acc_y', 'acc_z', 'vel_x', 'vel_y', 'vel_z'])
+                
+                while True:
+                    # Чтение заголовка
+                    hdr_data = f_bin.read(HDR_SIZE)
+                    if not hdr_data or len(hdr_data) < HDR_SIZE:
+                        break
+                    
+                    magic, timestamp, fs, n, temp10, hum10 = struct.unpack(HDR_FMT, hdr_data)
+                    
+                    if magic != MAGIC:
+                        continue
+                    
+                    # Чтение данных
+                    data_size = n * 3 * 2
+                    data = f_bin.read(data_size)
+                    if len(data) < data_size:
+                        break
+                    
+                    # Парсинг данных
+                    samples = np.frombuffer(data, dtype=np.int16).reshape(n, 3)
+                    samples = samples.astype(np.float32) * ACC_SCALE / 256.0
+                    
+                    # Запись каждой строки
+                    for i in range(n):
+                        writer.writerow([
+                            timestamp, fs, n,
+                            temp10/10.0 if temp10 != -999 else '',
+                            hum10/10.0 if hum10 != -999 else '',
+                            samples[i, 0], samples[i, 1], samples[i, 2],
+                            '', '', ''  # Место для виброскорости (можно рассчитать позже)
+                        ])
+            
+            self.status_label.setText(f"Экспорт завершен: {csv_file}")
+            
+        except Exception as e:
+            self.status_label.setText(f"Ошибка экспорта: {str(e)}")
+    
+    def update_data(self):
+        if not self.serial_port or not self.serial_port.is_open:
+            return
+        
+        # Чтение кадров
+        frames_read = 0
+        current_time = time.time()
+        
+        while frames_read < 10:  # Чтение до 10 кадров за обновление
+            frame = self.reader.read_frame()
+            if not frame:
+                break
+            
+            frames_read += 1
+            self.frame_count += 1
+            
+            # Обновление частоты дискретизации
+            if self.fs is None:
+                self.fs = frame['fs']
+                self.max_samples = int(self.fs * WINDOW_SEC)
+                for key in ['x', 'y', 'z']:
+                    self.data_buffers[key] = np.zeros(self.max_samples)
+                self.time_buffer = np.arange(self.max_samples) / self.fs
+            
+            # Добавление данных в буфер
+            new_samples = frame['n']
+            for key in ['x', 'y', 'z']:
+                # Сдвиг буфера
+                if len(self.data_buffers[key]) + new_samples > self.max_samples:
+                    self.data_buffers[key] = np.roll(self.data_buffers[key], -new_samples)
+                
+                # Добавление новых данных
+                start_idx = max(0, len(self.data_buffers[key]) - new_samples)
+                self.data_buffers[key][start_idx:start_idx + new_samples] = frame[key]
+            
+            # Обновление температуры и влажности
+            if not np.isnan(frame['temp']):
+                self.temperatures.append(frame['temp'])
+                if len(self.temperatures) > 10:
+                    self.temperatures.pop(0)
+            
+            if not np.isnan(frame['hum']):
+                self.humidities.append(frame['hum'])
+                if len(self.humidities) > 10:
+                    self.humidities.pop(0)
+        
+        # Обновление графиков
+        if self.fs is not None and len(self.data_buffers['x']) > 0:
+            # Обрезка буферов до актуальных данных
+            valid_samples = min(len(self.data_buffers['x']), self.max_samples)
+            time_data = self.time_buffer[:valid_samples]
+            
+            # Обновление вкладок
+            self.x_tab.update_plots(time_data, self.data_buffers['x'][:valid_samples], self.fs)
+            self.y_tab.update_plots(time_data, self.data_buffers['y'][:valid_samples], self.fs)
+            self.z_tab.update_plots(time_data, self.data_buffers['z'][:valid_samples], self.fs)
+            
+            # Расчет FPS
+            fps = 0
+            if current_time - self.last_update > 0:
+                fps = frames_read / (current_time - self.last_update)
+            self.last_update = current_time
+            
+            # Обновление статуса
+            status_text = (f"Кадров: {self.frame_count} | "
+                          f"FPS: {fps:.1f} | "
+                          f"Частота: {self.fs} Гц | ")
+            
+            if self.temperatures:
+                avg_temp = np.mean(self.temperatures)
+                avg_hum = np.mean(self.humidities) if self.humidities else 0
+                status_text += f"Температура: {avg_temp:.1f}°C | Влажность: {avg_hum:.1f}%"
+            
+            if self.is_recording:
+                elapsed = int(time.time() - self.record_start_time)
+                remaining = max(0, self.record_duration - elapsed)
+                status_text += f" | Запись: {elapsed}/{self.record_duration}с ({remaining}с осталось)"
+            
+            self.status_label.setText(status_text)
+            
+            # Обновление меток температуры и влажности
+            if self.temperatures:
+                self.temp_label.setText(f"Температура: {np.mean(self.temperatures):.1f}°C")
+            if self.humidities:
+                self.hum_label.setText(f"Влажность: {np.mean(self.humidities):.1f}%")
+
+def main():
+    app = QtWidgets.QApplication([])
+    
+    # Настройка стиля
+    app.setStyle('Fusion')
+    
+    # Создание и отображение главного окна
+    window = MainWindow()
+    window.show()
+    
+    app.exec()
+
+if __name__ == "__main__":
+    main()
